@@ -6,7 +6,10 @@ use DataDog\AuditBundle\DBAL\AuditLogger;
 use DataDog\AuditBundle\Entity\AuditLog;
 use DataDog\AuditBundle\Entity\Association;
 
+use DataDog\AuditBundle\Model\BlamerInterface;
+use DataDog\AuditBundle\Model\LabelerInterface;
 use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorage;
+use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
 use Symfony\Component\Security\Core\User\UserInterface;
 use Doctrine\DBAL\Types\Type;
 use Doctrine\DBAL\Logging\LoggerChain;
@@ -17,9 +20,21 @@ use Doctrine\ORM\Mapping\ClassMetadataInfo;
 use Doctrine\ORM\EntityManager;
 use Doctrine\ORM\Event\OnFlushEventArgs;
 
+/**
+ * Class AuditSubscriber
+ * @package DataDog\AuditBundle\EventSubscriber
+ */
 class AuditSubscriber implements EventSubscriber
 {
+    /**
+     * @var LabelerInterface|null
+     */
     protected $labeler;
+
+    /**
+     * @var BlamerInterface|null
+     */
+    protected $blamer;
 
     /**
      * @var SQLLogger
@@ -43,25 +58,50 @@ class AuditSubscriber implements EventSubscriber
     protected $assocInsertStmt;
     protected $auditInsertStmt;
 
-    /** @var UserInterface */
-    protected $blameUser;
-
-    public function __construct(TokenStorage $securityTokenStorage)
+    public function __construct(TokenStorageInterface $securityTokenStorage)
     {
         $this->securityTokenStorage = $securityTokenStorage;
     }
 
-    public function setLabeler(callable $labeler = null)
+    /**
+     * @param LabelerInterface|null $labeler
+     * @return $this
+     */
+    public function setLabeler(LabelerInterface $labeler = null)
     {
         $this->labeler = $labeler;
         return $this;
     }
 
+    /**
+     * @return LabelerInterface|null
+     */
     public function getLabeler()
     {
         return $this->labeler;
     }
 
+    /**
+     * @param BlamerInterface|null $blamer
+     * @return $this
+     */
+    public function setBlamer(BlamerInterface $blamer = null)
+    {
+        $this->blamer = $blamer;
+        return $this;
+    }
+
+    /**
+     * @return BlamerInterface|null
+     */
+    public function getBlamer()
+    {
+        return $this->blamer;
+    }
+
+    /**
+     * @param array $auditedEntities
+     */
     public function addAuditedEntities(array $auditedEntities)
     {
         // use entity names as array keys for easier lookup
@@ -70,6 +110,9 @@ class AuditSubscriber implements EventSubscriber
         }
     }
 
+    /**
+     * @param array $unauditedEntities
+     */
     public function addUnauditedEntities(array $unauditedEntities)
     {
         // use entity names as array keys for easier lookup
@@ -78,11 +121,18 @@ class AuditSubscriber implements EventSubscriber
         }
     }
 
+    /**
+     * @return array
+     */
     public function getUnauditedEntities()
     {
         return array_keys($this->unauditedEntities);
     }
 
+    /**
+     * @param $entity
+     * @return bool
+     */
     protected function isEntityUnaudited($entity)
     {
         if (!empty($this->auditedEntities)) {
@@ -107,6 +157,9 @@ class AuditSubscriber implements EventSubscriber
         return $isEntityUnaudited;
     }
 
+    /**
+     * @param OnFlushEventArgs $args
+     */
     public function onFlush(OnFlushEventArgs $args)
     {
         $em = $args->getEntityManager();
@@ -180,6 +233,11 @@ class AuditSubscriber implements EventSubscriber
         }
     }
 
+    /**
+     * @param EntityManager $em
+     * @throws \Doctrine\DBAL\DBALException
+     * @throws \ReflectionException
+     */
     protected function flush(EntityManager $em)
     {
         $em->getConnection()->getConfiguration()->setSQLLogger($this->old);
@@ -230,30 +288,48 @@ class AuditSubscriber implements EventSubscriber
         $this->dissociated = [];
     }
 
+    /**
+     * @param EntityManager $em
+     * @param               $source
+     * @param               $target
+     * @param array         $mapping
+     */
     protected function associate(EntityManager $em, $source, $target, array $mapping)
     {
         $this->audit($em, [
             'source' => $this->assoc($em, $source),
             'target' => $this->assoc($em, $target),
             'action' => 'associate',
-            'blame' => $this->blame($em),
-            'diff' => null,
-            'tbl' => $mapping['joinTable']['name'],
+            'blame'  => $this->blame($em),
+            'diff'   => null,
+            'tbl'    => $mapping['joinTable']['name'],
         ]);
     }
 
+    /**
+     * @param EntityManager $em
+     * @param               $source
+     * @param               $target
+     * @param               $id
+     * @param array         $mapping
+     */
     protected function dissociate(EntityManager $em, $source, $target, $id, array $mapping)
     {
         $this->audit($em, [
             'source' => $this->assoc($em, $source),
             'target' => array_merge($this->assoc($em, $target), ['fk' => $id]),
             'action' => 'dissociate',
-            'blame' => $this->blame($em),
-            'diff' => null,
-            'tbl' => $mapping['joinTable']['name'],
+            'blame'  => $this->blame($em),
+            'diff'   => null,
+            'tbl'    => $mapping['joinTable']['name'],
         ]);
     }
 
+    /**
+     * @param EntityManager $em
+     * @param               $entity
+     * @param array         $ch
+     */
     protected function insert(EntityManager $em, $entity, array $ch)
     {
         $diff = $this->diff($em, $entity, $ch);
@@ -265,12 +341,17 @@ class AuditSubscriber implements EventSubscriber
             'action' => 'insert',
             'source' => $this->assoc($em, $entity),
             'target' => null,
-            'blame' => $this->blame($em),
-            'diff' => json_encode($diff),
-            'tbl' => $meta->table['name'],
+            'blame'  => $this->blame($em),
+            'diff'   => json_encode($diff),
+            'tbl'    => $meta->table['name'],
         ]);
     }
 
+    /**
+     * @param EntityManager $em
+     * @param               $entity
+     * @param array         $ch
+     */
     protected function update(EntityManager $em, $entity, array $ch)
     {
         $diff = $this->diff($em, $entity, $ch);
@@ -282,12 +363,18 @@ class AuditSubscriber implements EventSubscriber
             'action' => 'update',
             'source' => $this->assoc($em, $entity),
             'target' => null,
-            'blame' => $this->blame($em),
-            'diff' => json_encode($diff),
-            'tbl' => $meta->table['name'],
+            'blame'  => $this->blame($em),
+            'diff'   => json_encode($diff),
+            'tbl'    => $meta->table['name'],
         ]);
     }
 
+    /**
+     * @param EntityManager $em
+     * @param               $entity
+     * @param               $id
+     * @throws \Doctrine\DBAL\DBALException
+     */
     protected function remove(EntityManager $em, $entity, $id)
     {
         $meta = $em->getClassMetadata(get_class($entity));
@@ -296,12 +383,17 @@ class AuditSubscriber implements EventSubscriber
             'action' => 'remove',
             'source' => $source,
             'target' => null,
-            'blame' => $this->blame($em),
-            'diff' => null,
-            'tbl' => $meta->table['name'],
+            'blame'  => $this->blame($em),
+            'diff'   => null,
+            'tbl'    => $meta->table['name'],
         ]);
     }
 
+    /**
+     * @param EntityManager $em
+     * @param array         $data
+     * @throws \Doctrine\DBAL\DBALException
+     */
     protected function audit(EntityManager $em, array $data)
     {
         $c = $em->getConnection();
@@ -349,6 +441,13 @@ class AuditSubscriber implements EventSubscriber
         $this->auditInsertStmt->execute();
     }
 
+    /**
+     * @param EntityManager $em
+     * @param               $entity
+     * @return mixed|string
+     * @throws \Doctrine\DBAL\DBALException
+     * @throws \Doctrine\ORM\Mapping\MappingException
+     */
     protected function id(EntityManager $em, $entity)
     {
         $meta = $em->getClassMetadata(get_class($entity));
@@ -361,6 +460,14 @@ class AuditSubscriber implements EventSubscriber
         return $pk;
     }
 
+    /**
+     * @param EntityManager $em
+     * @param               $entity
+     * @param array         $ch
+     * @return array
+     * @throws \Doctrine\DBAL\DBALException
+     * @throws \Doctrine\ORM\Mapping\MappingException
+     */
     protected function diff(EntityManager $em, $entity, array $ch)
     {
         $uow = $em->getUnitOfWork();
@@ -388,6 +495,11 @@ class AuditSubscriber implements EventSubscriber
         return $diff;
     }
 
+    /**
+     * @param EntityManager $em
+     * @param null          $association
+     * @return array|null
+     */
     protected function assoc(EntityManager $em, $association = null)
     {
         if (null === $association) {
@@ -410,6 +522,10 @@ class AuditSubscriber implements EventSubscriber
         return $res;
     }
 
+    /**
+     * @param $className
+     * @return string
+     */
     protected function typ($className)
     {
         // strip prefixes and repeating garbage from name
@@ -420,26 +536,28 @@ class AuditSubscriber implements EventSubscriber
         }, explode('\\', $className)));
     }
 
+    /**
+     * @param EntityManager $em
+     * @param               $entity
+     * @return mixed|string
+     */
     protected function label(EntityManager $em, $entity)
     {
-        if (is_callable($this->labeler)) {
-            return call_user_func($this->labeler, $entity);
+        if ($this->labeler instanceof LabelerInterface) {
+            $this->labeler->setEntityManager($em);
+            return $this->labeler->label($entity);
         }
-        $meta = $em->getClassMetadata(get_class($entity));
-        switch (true) {
-        case $meta->hasField('title'):
-            return $meta->getReflectionProperty('title')->getValue($entity);
-        case $meta->hasField('name'):
-            return $meta->getReflectionProperty('name')->getValue($entity);
-        case $meta->hasField('label'):
-            return $meta->getReflectionProperty('label')->getValue($entity);
-        case $meta->getReflectionClass()->hasMethod('__toString'):
-            return (string)$entity;
-        default:
-            return "Unlabeled";
-        }
+
+        return "Unlabeled";
     }
 
+    /**
+     * @param EntityManager $em
+     * @param Type          $type
+     * @param               $value
+     * @return mixed
+     * @throws \Doctrine\DBAL\DBALException
+     */
     protected function value(EntityManager $em, Type $type, $value)
     {
         $platform = $em->getConnection()->getDatabasePlatform();
@@ -451,10 +569,18 @@ class AuditSubscriber implements EventSubscriber
         }
     }
 
+    /**
+     * @param EntityManager $em
+     * @return array|null
+     */
     protected function blame(EntityManager $em)
     {
         if ($this->blameUser instanceof UserInterface) {
             return $this->assoc($em, $this->blameUser);
+        }
+        if ($this->blamer instanceof BlamerInterface) {
+            $blamed = $this->blamer->blame($this->securityTokenStorage->getToken());
+            return $blamed ? $this->assoc($em, $blamed) : null;
         }
         $token = $this->securityTokenStorage->getToken();
         if ($token && $token->getUser() instanceof UserInterface) {
@@ -463,13 +589,11 @@ class AuditSubscriber implements EventSubscriber
         return null;
     }
 
+    /**
+     * @return array|string[]
+     */
     public function getSubscribedEvents()
     {
         return [Events::onFlush];
-    }
-
-    public function setBlameUser(UserInterface $user)
-    {
-        $this->blameUser = $user;
     }
 }

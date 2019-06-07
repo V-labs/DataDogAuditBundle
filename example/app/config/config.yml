@@ -4,12 +4,29 @@ imports:
 
 parameters:
   locale: en
+  env(DATABASE_URL): ''
 
 services:
   twig.audit.extension:
     class: AppBundle\Twig\AuditExtension
     tags:
       - { name: twig.extension }
+  app.datadog.labeler:
+    class: AppBundle\Utils\Labeler
+  app.datadog.blamer:
+    class: AppBundle\Utils\Blamer
+  datadog.event_subscriber.audit:
+    class: DataDog\AuditBundle\EventSubscriber\AuditSubscriber
+    arguments: ["@security.token_storage"]
+    calls:
+      -   method: setLabeler
+          arguments:
+            - '@app.datadog.labeler'
+      -   method: setBlamer
+          arguments:
+            - '@app.datadog.blamer'
+    tags:
+      - { name: doctrine.event_subscriber, connection: default }
 
 framework:
   secret: "%secret%"
