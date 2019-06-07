@@ -575,17 +575,11 @@ class AuditSubscriber implements EventSubscriber
      */
     protected function blame(EntityManager $em)
     {
-        if ($this->blameUser instanceof UserInterface) {
-            return $this->assoc($em, $this->blameUser);
-        }
         if ($this->blamer instanceof BlamerInterface) {
             $blamed = $this->blamer->blame($this->securityTokenStorage->getToken());
-            return $blamed ? $this->assoc($em, $blamed) : null;
+            if($blamed) return $this->assoc($em, $blamed);
         }
-        $token = $this->securityTokenStorage->getToken();
-        if ($token && $token->getUser() instanceof UserInterface) {
-            return $this->assoc($em, $token->getUser());
-        }
+
         return null;
     }
 
