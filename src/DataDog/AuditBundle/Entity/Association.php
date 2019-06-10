@@ -33,7 +33,7 @@ class Association
     private $label;
 
     /**
-     * @ORM\Column
+     * @ORM\Column(type="json")
      */
     private $fk;
 

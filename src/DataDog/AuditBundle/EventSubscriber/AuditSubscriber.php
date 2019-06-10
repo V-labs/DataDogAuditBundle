@@ -444,20 +444,23 @@ class AuditSubscriber implements EventSubscriber
     /**
      * @param EntityManager $em
      * @param               $entity
-     * @return mixed|string
+     * @return array
      * @throws \Doctrine\DBAL\DBALException
-     * @throws \Doctrine\ORM\Mapping\MappingException
      */
     protected function id(EntityManager $em, $entity)
     {
         $meta = $em->getClassMetadata(get_class($entity));
-        $pk = $meta->getSingleIdentifierFieldName();
-        $pk = $this->value(
-            $em,
-            Type::getType($meta->fieldMappings[$pk]['type']),
-            $meta->getReflectionProperty($pk)->getValue($entity)
-        );
-        return $pk;
+        $identifiers = $meta->getIdentifierColumnNames();
+
+        $result = [];
+        foreach($identifiers as $pk){
+            $result[$pk] = $this->value(
+                $em,
+                Type::getType($meta->fieldMappings[$pk]['type']),
+                $meta->getReflectionProperty($pk)->getValue($entity)
+            );
+        }
+        return $result;
     }
 
     /**
@@ -507,16 +510,25 @@ class AuditSubscriber implements EventSubscriber
         }
 
         $meta = get_class($association);
-        $res = ['class' => $meta, 'typ' => $this->typ($meta), 'tbl' => null, 'label' => null];
 
         try {
             $meta = $em->getClassMetadata($meta);
-            $res['tbl'] = $meta->table['name'];
-            $em->getUnitOfWork()->initializeObject($association); // ensure that proxies are initialized
-            $res['fk'] = (string)$this->id($em, $association);
-            $res['label'] = $this->label($em, $association);
+            $em->getUnitOfWork()->initializeObject($association);
+            $res = [
+                'class' => $meta,
+                'typ'   => $this->typ($meta),
+                'tbl'   => $meta->table['name'],
+                'label' => $this->label($em, $association),
+                'fk'    => $this->id($em, $association)
+            ];
         } catch (\Exception $e) {
-            $res['fk'] = (string) $association->getId();
+            $res = [
+                'class' => $meta,
+                'typ'   => $this->typ($meta),
+                'tbl'   => null,
+                'label' => null,
+                'fk'    => $association->getId()
+            ];
         }
 
         return $res;
@@ -562,10 +574,10 @@ class AuditSubscriber implements EventSubscriber
     {
         $platform = $em->getConnection()->getDatabasePlatform();
         switch ($type->getName()) {
-        case Type::BOOLEAN:
-            return $type->convertToPHPValue($value, $platform); // json supports boolean values
-        default:
-            return $type->convertToDatabaseValue($value, $platform);
+            case Type::BOOLEAN:
+                return $type->convertToPHPValue($value, $platform); // json supports boolean values
+            default:
+                return $type->convertToDatabaseValue($value, $platform);
         }
     }
 
