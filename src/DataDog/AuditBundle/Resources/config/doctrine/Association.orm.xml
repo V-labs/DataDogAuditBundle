@@ -13,6 +13,7 @@
     <field name="tbl" length="128" nullable="true" />
     <field name="label" nullable="true" />
     <field name="fk" type="json" />
+    <field name="roles" type="array" nullable="true" />
     <field name="class" />
 
   </entity>

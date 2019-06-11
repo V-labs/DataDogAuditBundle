@@ -22,6 +22,7 @@ use Doctrine\ORM\Events;
 use Doctrine\ORM\Mapping\ClassMetadataInfo;
 use Doctrine\ORM\EntityManager;
 use Doctrine\ORM\Event\OnFlushEventArgs;
+use Symfony\Component\Security\Core\User\UserInterface;
 
 /**
  * Class AuditSubscriber
@@ -483,6 +484,20 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
     }
 
     /**
+     * @param $entity
+     * @return mixed|null
+     */
+    protected function roles($entity)
+    {
+        $meta = $this->em->getClassMetadata(get_class($entity));
+        if($entity instanceof UserInterface){
+            return $meta->getReflectionProperty('roles')->getValue($entity);
+        }
+
+        return null;
+    }
+
+    /**
      * @param       $entity
      * @param array $ch
      * @return array
@@ -533,7 +548,8 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
                 'typ'   => $this->typ($meta->name),
                 'tbl'   => $meta->table['name'],
                 'label' => $this->label($association),
-                'fk'    => $this->id($association)
+                'fk'    => $this->id($association),
+                'roles' => $this->roles($association)
             ];
         } catch (\Exception $e) {
             $res = [
@@ -541,7 +557,8 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
                 'typ'   => $this->typ($class),
                 'tbl'   => null,
                 'label' => null,
-                'fk'    => $association->getId() //make test for existing getId() method on entity
+                'fk'    => $association->getId(), //make test for existing getId() method on entity
+                'roles' => null
             ];
         }
 

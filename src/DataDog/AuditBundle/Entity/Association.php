@@ -38,6 +38,11 @@ class Association
     private $fk;
 
     /**
+     * @ORM\Column(type="array")
+     */
+    private $roles;
+
+    /**
      * @ORM\Column
      */
     private $class;
@@ -71,6 +76,11 @@ class Association
     public function getFk()
     {
         return $this->fk;
+    }
+
+    public function getRole()
+    {
+        return $this->roles;
     }
 
     public function getClass()
