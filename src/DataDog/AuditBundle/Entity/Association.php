@@ -38,7 +38,7 @@ class Association
     private $fk;
 
     /**
-     * @ORM\Column(type="array")
+     * @ORM\Column(type="simple_array")
      */
     private $roles;
 
@@ -78,7 +78,7 @@ class Association
         return $this->fk;
     }
 
-    public function getRole()
+    public function getRoles()
     {
         return $this->roles;
     }

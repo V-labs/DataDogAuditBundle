@@ -478,8 +478,8 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
                 $entityKey = $meta->getReflectionProperty($pk)->getValue($entity);
                 $result[$pk] = $this->id($entityKey, false);
             }
-
         }
+
         return $result;
     }
 
@@ -525,6 +525,7 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
                 ];
             }
         }
+
         return $diff;
     }
 

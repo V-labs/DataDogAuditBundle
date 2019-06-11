@@ -17,5 +17,7 @@ DataDog\AuditBundle\Entity\Association:
       nullable: true
     fk:
       type: json
+    roles:
+      type: simple_array
     class:
       type: string
