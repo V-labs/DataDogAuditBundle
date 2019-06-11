@@ -16,6 +16,6 @@ DataDog\AuditBundle\Entity\Association:
     label:
       nullable: true
     fk:
-      type: string
+      type: json
     class:
       type: string

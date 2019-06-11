@@ -366,7 +366,7 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
             'source' => $this->assoc($entity),
             'target' => null,
             'blame'  => $this->blame(),
-            'diff'   => json_encode($diff),
+            'diff'   => $diff,
             'tbl'    => $meta->table['name'],
         ]);
     }
@@ -388,7 +388,7 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
             'source' => $this->assoc($entity),
             'target' => null,
             'blame'  => $this->blame(),
-            'diff'   => json_encode($diff),
+            'diff'   => $diff,
             'tbl'    => $meta->table['name'],
         ]);
     }
@@ -461,7 +461,7 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
      * @return array
      * @throws \Doctrine\DBAL\DBALException
      */
-    protected function id($entity, $jsonEncode = true)
+    protected function id($entity)
     {
         $meta = $this->em->getClassMetadata(get_class($entity));
         $identifiers = $meta->getIdentifierFieldNames();
@@ -479,13 +479,12 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
             }
 
         }
-        return $jsonEncode ? json_encode($result) : $result;
+        return $result;
     }
 
     /**
-     * @param EntityManager $em
-     * @param               $entity
-     * @param array         $ch
+     * @param       $entity
+     * @param array $ch
      * @return array
      * @throws \Doctrine\DBAL\DBALException
      * @throws \Doctrine\ORM\Mapping\MappingException
@@ -542,7 +541,7 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
                 'typ'   => $this->typ($class),
                 'tbl'   => null,
                 'label' => null,
-                'fk'    => $association->getId()
+                'fk'    => $association->getId() //make test for existing getId() method on entity
             ];
         }
 
