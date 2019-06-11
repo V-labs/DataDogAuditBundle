@@ -1,6 +1,13 @@
 services:
+  datadog.event_subscriber.blamer:
+    class: DataDog\AuditBundle\EventSubscriber\Blamer
+  datadog.event_subscriber.labeler:
+    class: DataDog\AuditBundle\EventSubscriber\Labeler
   datadog.event_subscriber.audit:
     class: DataDog\AuditBundle\EventSubscriber\AuditSubscriber
     arguments: ["@security.token_storage"]
+    calls:
+      - [setBlamer, ['@datadog.event_subscriber.blamer']]
+      - [setLabeler, ['@datadog.event_subscriber.labeler']]
     tags:
       - { name: doctrine.event_subscriber, connection: default }
