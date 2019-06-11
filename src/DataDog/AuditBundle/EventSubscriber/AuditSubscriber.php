@@ -529,8 +529,8 @@ class AuditSubscriber implements EventSubscriber, FlusherInterface
             $meta = $this->em->getClassMetadata($class);
             $this->em->getUnitOfWork()->initializeObject($association);
             $res = [
-                'class' => $class,
-                'typ'   => $this->typ($class),
+                'class' => $meta->name,
+                'typ'   => $this->typ($meta->name),
                 'tbl'   => $meta->table['name'],
                 'label' => $this->label($association),
                 'fk'    => $this->id($association)
