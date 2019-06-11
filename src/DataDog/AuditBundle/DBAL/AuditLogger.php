@@ -2,16 +2,21 @@
 
 namespace DataDog\AuditBundle\DBAL;
 
+use DataDog\AuditBundle\Model\FlusherInterface;
 use Doctrine\DBAL\Logging\SQLLogger;
 
 class AuditLogger implements SQLLogger
 {
     /**
-     * @var callable
+     * @var FlusherInterface
      */
     private $flusher;
 
-    public function __construct(callable $flusher)
+    /**
+     * AuditLogger constructor.
+     * @param FlusherInterface $flusher
+     */
+    public function __construct(FlusherInterface $flusher)
     {
         $this->flusher = $flusher;
     }
@@ -23,7 +28,7 @@ class AuditLogger implements SQLLogger
     {
         // right before commit insert all audit entries
         if ($sql === '"COMMIT"') {
-            call_user_func($this->flusher);
+            $this->flusher->flush();
         }
     }
 

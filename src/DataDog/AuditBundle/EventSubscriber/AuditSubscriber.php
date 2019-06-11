@@ -7,10 +7,13 @@ use DataDog\AuditBundle\Entity\AuditLog;
 use DataDog\AuditBundle\Entity\Association;
 
 use DataDog\AuditBundle\Model\BlamerInterface;
+use DataDog\AuditBundle\Model\FlusherInterface;
 use DataDog\AuditBundle\Model\LabelerInterface;
-use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorage;
+use Doctrine\Common\Collections\Collection;
+use Doctrine\DBAL\Driver\Statement;
+use Doctrine\ORM\EntityManagerInterface;
+use Doctrine\ORM\PersistentCollection;
 use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
-use Symfony\Component\Security\Core\User\UserInterface;
 use Doctrine\DBAL\Types\Type;
 use Doctrine\DBAL\Logging\LoggerChain;
 use Doctrine\DBAL\Logging\SQLLogger;
@@ -24,8 +27,18 @@ use Doctrine\ORM\Event\OnFlushEventArgs;
  * Class AuditSubscriber
  * @package DataDog\AuditBundle\EventSubscriber
  */
-class AuditSubscriber implements EventSubscriber
+class AuditSubscriber implements EventSubscriber, FlusherInterface
 {
+    /**
+     * @var EntityManagerInterface
+     */
+    protected $em;
+
+    /**
+     * @var TokenStorageInterface
+     */
+    protected $securityTokenStorage;
+
     /**
      * @var LabelerInterface|null
      */
@@ -42,11 +55,13 @@ class AuditSubscriber implements EventSubscriber
     protected $old;
 
     /**
-     * @var TokenStorage
+     * @var array
      */
-    protected $securityTokenStorage;
-
     protected $auditedEntities = [];
+
+    /**
+     * @var array
+     */
     protected $unauditedEntities = [];
 
     protected $inserted = []; // [$source, $changeset]
@@ -55,9 +70,20 @@ class AuditSubscriber implements EventSubscriber
     protected $associated = [];   // [$source, $target, $mapping]
     protected $dissociated = []; // [$source, $target, $id, $mapping]
 
+    /**
+     * @var Statement
+     */
     protected $assocInsertStmt;
+
+    /**
+     * @var Statement
+     */
     protected $auditInsertStmt;
 
+    /**
+     * AuditSubscriber constructor.
+     * @param TokenStorageInterface $securityTokenStorage
+     */
     public function __construct(TokenStorageInterface $securityTokenStorage)
     {
         $this->securityTokenStorage = $securityTokenStorage;
@@ -76,7 +102,7 @@ class AuditSubscriber implements EventSubscriber
     /**
      * @return LabelerInterface|null
      */
-    public function getLabeler()
+    protected function getLabeler()
     {
         return $this->labeler;
     }
@@ -94,7 +120,7 @@ class AuditSubscriber implements EventSubscriber
     /**
      * @return BlamerInterface|null
      */
-    public function getBlamer()
+    protected function getBlamer()
     {
         return $this->blamer;
     }
@@ -158,258 +184,247 @@ class AuditSubscriber implements EventSubscriber
     }
 
     /**
-     * @param OnFlushEventArgs $args
+     * @return LoggerChain
      */
-    public function onFlush(OnFlushEventArgs $args)
-    {
-        $em = $args->getEntityManager();
-        $uow = $em->getUnitOfWork();
-
-        // extend the sql logger
-        $this->old = $em->getConnection()->getConfiguration()->getSQLLogger();
+    protected function extendsSQLLogger(){
         $new = new LoggerChain();
-        $new->addLogger(new AuditLogger(function () use($em) {
-            $this->flush($em);
-        }));
+        $new->addLogger(new AuditLogger($this));
+
+        $this->old = $this->em->getConnection()->getConfiguration()->getSQLLogger();
         if ($this->old instanceof SQLLogger) {
             $new->addLogger($this->old);
         }
-        $em->getConnection()->getConfiguration()->setSQLLogger($new);
+
+        $this->em->getConnection()->getConfiguration()->setSQLLogger($new);
+
+        return $new;
+    }
+
+    /**
+     * @param OnFlushEventArgs $args
+     * @throws \Doctrine\DBAL\DBALException
+     */
+    public function onFlush(OnFlushEventArgs $args)
+    {
+        $this->em = $args->getEntityManager();
+        $this->extendsSQLLogger();
+
+        $uow = $this->em->getUnitOfWork();
 
         foreach ($uow->getScheduledEntityUpdates() as $entity) {
-            if ($this->isEntityUnaudited($entity)) {
-                continue;
-            }
+            if ($this->isEntityUnaudited($entity)) continue;
             $this->updated[] = [$entity, $uow->getEntityChangeSet($entity)];
         }
+
         foreach ($uow->getScheduledEntityInsertions() as $entity) {
-            if ($this->isEntityUnaudited($entity)) {
-                continue;
-            }
+            if ($this->isEntityUnaudited($entity)) continue;
             $this->inserted[] = [$entity, $ch = $uow->getEntityChangeSet($entity)];
         }
+
         foreach ($uow->getScheduledEntityDeletions() as $entity) {
-            if ($this->isEntityUnaudited($entity)) {
-                continue;
-            }
+            if ($this->isEntityUnaudited($entity)) continue;
             $uow->initializeObject($entity);
-            $this->removed[] = [$entity, $this->id($em, $entity)];
+            $this->removed[] = [$entity, $this->id($entity)];
         }
+
+        /** @var PersistentCollection $collection */
         foreach ($uow->getScheduledCollectionUpdates() as $collection) {
-            if ($this->isEntityUnaudited($collection->getOwner())) {
-                continue;
-            }
+            if ($this->isEntityUnaudited($collection->getOwner())) continue;
             $mapping = $collection->getMapping();
-            if (!$mapping['isOwningSide'] || $mapping['type'] !== ClassMetadataInfo::MANY_TO_MANY) {
-                continue; // ignore inverse side or one to many relations
-            }
+            if (!$mapping['isOwningSide'] || $mapping['type'] !== ClassMetadataInfo::MANY_TO_MANY) continue; // ignore inverse side or one to many relations
             foreach ($collection->getInsertDiff() as $entity) {
-                if ($this->isEntityUnaudited($entity)) {
-                    continue;
-                }
+                if ($this->isEntityUnaudited($entity)) continue;
                 $this->associated[] = [$collection->getOwner(), $entity, $mapping];
             }
             foreach ($collection->getDeleteDiff() as $entity) {
-                if ($this->isEntityUnaudited($entity)) {
-                    continue;
-                }
-                $this->dissociated[] = [$collection->getOwner(), $entity, $this->id($em, $entity), $mapping];
+                if ($this->isEntityUnaudited($entity)) continue;
+                $this->dissociated[] = [$collection->getOwner(), $entity, $this->id($entity), $mapping];
             }
         }
+
+        /** @var PersistentCollection $collection */
         foreach ($uow->getScheduledCollectionDeletions() as $collection) {
-            if ($this->isEntityUnaudited($collection->getOwner())) {
-                continue;
-            }
+            if ($this->isEntityUnaudited($collection->getOwner())) continue;
             $mapping = $collection->getMapping();
-            if (!$mapping['isOwningSide'] || $mapping['type'] !== ClassMetadataInfo::MANY_TO_MANY) {
-                continue; // ignore inverse side or one to many relations
-            }
+            if (!$mapping['isOwningSide'] || $mapping['type'] !== ClassMetadataInfo::MANY_TO_MANY)  continue; // ignore inverse side or one to many relations
             foreach ($collection->toArray() as $entity) {
                 if ($this->isEntityUnaudited($entity)) {
                     continue;
                 }
-                $this->dissociated[] = [$collection->getOwner(), $entity, $this->id($em, $entity), $mapping];
+                $this->dissociated[] = [$collection->getOwner(), $entity, $this->id($entity), $mapping];
             }
         }
     }
 
     /**
-     * @param EntityManager $em
      * @throws \Doctrine\DBAL\DBALException
+     * @throws \Doctrine\ORM\Mapping\MappingException
      * @throws \ReflectionException
      */
-    protected function flush(EntityManager $em)
+    public function flush()
     {
-        $em->getConnection()->getConfiguration()->setSQLLogger($this->old);
-        $uow = $em->getUnitOfWork();
+        $this->em->getConnection()->getConfiguration()->setSQLLogger($this->old);
+        $uow = $this->em->getUnitOfWork();
 
         $auditPersister = $uow->getEntityPersister(AuditLog::class);
         $rmAuditInsertSQL = new \ReflectionMethod($auditPersister, 'getInsertSQL');
         $rmAuditInsertSQL->setAccessible(true);
-        $this->auditInsertStmt = $em->getConnection()->prepare($rmAuditInsertSQL->invoke($auditPersister));
+        $this->auditInsertStmt = $this->em->getConnection()->prepare($rmAuditInsertSQL->invoke($auditPersister));
         $assocPersister = $uow->getEntityPersister(Association::class);
         $rmAssocInsertSQL = new \ReflectionMethod($assocPersister, 'getInsertSQL');
         $rmAssocInsertSQL->setAccessible(true);
-        $this->assocInsertStmt = $em->getConnection()->prepare($rmAssocInsertSQL->invoke($assocPersister));
+        $this->assocInsertStmt = $this->em->getConnection()->prepare($rmAssocInsertSQL->invoke($assocPersister));
 
         foreach ($this->updated as $entry) {
             list($entity, $ch) = $entry;
             // the changeset might be updated from UOW extra updates
             $ch = array_merge($ch, $uow->getEntityChangeSet($entity));
-            $this->update($em, $entity, $ch);
+            $this->update($entity, $ch);
         }
 
         foreach ($this->inserted as $entry) {
             list($entity, $ch) = $entry;
             // the changeset might be updated from UOW extra updates
             $ch = array_merge($ch, $uow->getEntityChangeSet($entity));
-            $this->insert($em, $entity, $ch);
+            $this->insert($entity, $ch);
         }
 
         foreach ($this->associated as $entry) {
             list($source, $target, $mapping) = $entry;
-            $this->associate($em, $source, $target, $mapping);
+            $this->associate($source, $target, $mapping);
         }
 
         foreach ($this->dissociated as $entry) {
             list($source, $target, $id, $mapping) = $entry;
-            $this->dissociate($em, $source, $target, $id, $mapping);
+            $this->dissociate($source, $target, $id, $mapping);
         }
 
         foreach ($this->removed as $entry) {
             list($entity, $id) = $entry;
-            $this->remove($em, $entity, $id);
+            $this->remove($entity, $id);
         }
 
-        $this->inserted = [];
-        $this->updated = [];
-        $this->removed = [];
-        $this->associated = [];
+        $this->inserted    = [];
+        $this->updated     = [];
+        $this->removed     = [];
+        $this->associated  = [];
         $this->dissociated = [];
     }
 
     /**
-     * @param EntityManager $em
-     * @param               $source
-     * @param               $target
-     * @param array         $mapping
-     */
-    protected function associate(EntityManager $em, $source, $target, array $mapping)
-    {
-        $this->audit($em, [
-            'source' => $this->assoc($em, $source),
-            'target' => $this->assoc($em, $target),
-            'action' => 'associate',
-            'blame'  => $this->blame($em),
-            'diff'   => null,
-            'tbl'    => $mapping['joinTable']['name'],
-        ]);
-    }
-
-    /**
-     * @param EntityManager $em
-     * @param               $source
-     * @param               $target
-     * @param               $id
-     * @param array         $mapping
-     */
-    protected function dissociate(EntityManager $em, $source, $target, $id, array $mapping)
-    {
-        $this->audit($em, [
-            'source' => $this->assoc($em, $source),
-            'target' => array_merge($this->assoc($em, $target), ['fk' => $id]),
-            'action' => 'dissociate',
-            'blame'  => $this->blame($em),
-            'diff'   => null,
-            'tbl'    => $mapping['joinTable']['name'],
-        ]);
-    }
-
-    /**
-     * @param EntityManager $em
-     * @param               $entity
-     * @param array         $ch
-     */
-    protected function insert(EntityManager $em, $entity, array $ch)
-    {
-        $diff = $this->diff($em, $entity, $ch);
-        if (empty($diff)) {
-            return; // if there is no entity diff, do not log it
-        }
-        $meta = $em->getClassMetadata(get_class($entity));
-        $this->audit($em, [
-            'action' => 'insert',
-            'source' => $this->assoc($em, $entity),
-            'target' => null,
-            'blame'  => $this->blame($em),
-            'diff'   => json_encode($diff),
-            'tbl'    => $meta->table['name'],
-        ]);
-    }
-
-    /**
-     * @param EntityManager $em
-     * @param               $entity
-     * @param array         $ch
-     */
-    protected function update(EntityManager $em, $entity, array $ch)
-    {
-        $diff = $this->diff($em, $entity, $ch);
-        if (empty($diff)) {
-            return; // if there is no entity diff, do not log it
-        }
-        $meta = $em->getClassMetadata(get_class($entity));
-        $this->audit($em, [
-            'action' => 'update',
-            'source' => $this->assoc($em, $entity),
-            'target' => null,
-            'blame'  => $this->blame($em),
-            'diff'   => json_encode($diff),
-            'tbl'    => $meta->table['name'],
-        ]);
-    }
-
-    /**
-     * @param EntityManager $em
-     * @param               $entity
-     * @param               $id
+     * @param       $source
+     * @param       $target
+     * @param array $mapping
      * @throws \Doctrine\DBAL\DBALException
      */
-    protected function remove(EntityManager $em, $entity, $id)
+    protected function associate($source, $target, array $mapping)
     {
-        $meta = $em->getClassMetadata(get_class($entity));
-        $source = array_merge($this->assoc($em, $entity), ['fk' => $id]);
-        $this->audit($em, [
+        $this->audit([
+            'source' => $this->assoc($source),
+            'target' => $this->assoc($target),
+            'action' => 'associate',
+            'blame'  => $this->blame(),
+            'diff'   => null,
+            'tbl'    => $mapping['joinTable']['name'],
+        ]);
+    }
+
+    /**
+     * @param       $source
+     * @param       $target
+     * @param       $id
+     * @param array $mapping
+     * @throws \Doctrine\DBAL\DBALException
+     */
+    protected function dissociate($source, $target, $id, array $mapping)
+    {
+        $this->audit([
+            'source' => $this->assoc($source),
+            'target' => array_merge($this->assoc($target), ['fk' => $id]),
+            'action' => 'dissociate',
+            'blame'  => $this->blame(),
+            'diff'   => null,
+            'tbl'    => $mapping['joinTable']['name'],
+        ]);
+    }
+
+    /**
+     * @param       $entity
+     * @param array $ch
+     * @throws \Doctrine\DBAL\DBALException
+     * @throws \Doctrine\ORM\Mapping\MappingException
+     */
+    protected function insert($entity, array $ch)
+    {
+        $diff = $this->diff($entity, $ch);
+        if (empty($diff)) {
+            return; // if there is no entity diff, do not log it
+        }
+        $meta = $this->em->getClassMetadata(get_class($entity));
+        $this->audit([
+            'action' => 'insert',
+            'source' => $this->assoc($entity),
+            'target' => null,
+            'blame'  => $this->blame(),
+            'diff'   => json_encode($diff),
+            'tbl'    => $meta->table['name'],
+        ]);
+    }
+
+    /**
+     * @param       $entity
+     * @param array $ch
+     * @throws \Doctrine\DBAL\DBALException
+     * @throws \Doctrine\ORM\Mapping\MappingException
+     */
+    protected function update($entity, array $ch)
+    {
+        $diff = $this->diff($entity, $ch);
+        if (empty($diff)) return; // if there is no entity diff, do not log it
+
+        $meta = $this->em->getClassMetadata(get_class($entity));
+        $this->audit([
+            'action' => 'update',
+            'source' => $this->assoc($entity),
+            'target' => null,
+            'blame'  => $this->blame(),
+            'diff'   => json_encode($diff),
+            'tbl'    => $meta->table['name'],
+        ]);
+    }
+
+    /**
+     * @param $entity
+     * @param $id
+     * @throws \Doctrine\DBAL\DBALException
+     */
+    protected function remove($entity, $id)
+    {
+        $meta   = $this->em->getClassMetadata(get_class($entity));
+        $source = array_merge($this->assoc($entity), ['fk' => $id]);
+        $this->audit([
             'action' => 'remove',
             'source' => $source,
             'target' => null,
-            'blame'  => $this->blame($em),
+            'blame'  => $this->blame(),
             'diff'   => null,
             'tbl'    => $meta->table['name'],
         ]);
     }
 
     /**
-     * @param EntityManager $em
      * @param array         $data
      * @throws \Doctrine\DBAL\DBALException
      */
-    protected function audit(EntityManager $em, array $data)
+    protected function audit(array $data)
     {
-        $c = $em->getConnection();
-        $p = $c->getDatabasePlatform();
-        $q = $em->getConfiguration()->getQuoteStrategy();
-
+        $meta = $this->em->getClassMetadata(Association::class);
         foreach (['source', 'target', 'blame'] as $field) {
-            if (null === $data[$field]) {
-                continue;
-            }
-            $meta = $em->getClassMetadata(Association::class);
+            if (null === $data[$field]) continue;
+
             $idx = 1;
             foreach ($meta->reflFields as $name => $f) {
-                if ($meta->isIdentifier($name)) {
-                    continue;
-                }
+                if ($meta->isIdentifier($name)) continue;
                 $typ = $meta->fieldMappings[$name]['type'];
 
                 $this->assocInsertStmt->bindValue($idx++, $data[$field][$name], $typ);
@@ -417,10 +432,10 @@ class AuditSubscriber implements EventSubscriber
             $this->assocInsertStmt->execute();
             // use id generator, it will always use identity strategy, since our
             // audit association explicitly sets that.
-            $data[$field] = $meta->idGenerator->generate($em, null);
+            $data[$field] = $meta->idGenerator->generate($this->em, null);
         }
 
-        $meta = $em->getClassMetadata(AuditLog::class);
+        $meta = $this->em->getClassMetadata(AuditLog::class);
         $data['loggedAt'] = new \DateTime();
         $idx = 1;
         foreach ($meta->reflFields as $name => $f) {
@@ -442,25 +457,29 @@ class AuditSubscriber implements EventSubscriber
     }
 
     /**
-     * @param EntityManager $em
      * @param               $entity
      * @return array
      * @throws \Doctrine\DBAL\DBALException
      */
-    protected function id(EntityManager $em, $entity)
+    protected function id($entity, $jsonEncode = true)
     {
-        $meta = $em->getClassMetadata(get_class($entity));
-        $identifiers = $meta->getIdentifierColumnNames();
+        $meta = $this->em->getClassMetadata(get_class($entity));
+        $identifiers = $meta->getIdentifierFieldNames();
 
         $result = [];
         foreach($identifiers as $pk){
-            $result[$pk] = $this->value(
-                $em,
-                Type::getType($meta->fieldMappings[$pk]['type']),
-                $meta->getReflectionProperty($pk)->getValue($entity)
-            );
+            if(isset($meta->fieldMappings[$pk])){
+                $result[$pk] = $this->value(
+                    Type::getType($meta->fieldMappings[$pk]['type']),
+                    $meta->getReflectionProperty($pk)->getValue($entity)
+                );
+            }else if(isset($meta->associationMappings[$pk]) && $meta->associationMappings[$pk]['id']){
+                $entityKey = $meta->getReflectionProperty($pk)->getValue($entity);
+                $result[$pk] = $this->id($entityKey, false);
+            }
+
         }
-        return $result;
+        return $jsonEncode ? json_encode($result) : $result;
     }
 
     /**
@@ -471,26 +490,23 @@ class AuditSubscriber implements EventSubscriber
      * @throws \Doctrine\DBAL\DBALException
      * @throws \Doctrine\ORM\Mapping\MappingException
      */
-    protected function diff(EntityManager $em, $entity, array $ch)
+    protected function diff($entity, array $ch)
     {
-        $uow = $em->getUnitOfWork();
-        $meta = $em->getClassMetadata(get_class($entity));
+        $meta = $this->em->getClassMetadata(get_class($entity));
         $diff = [];
         foreach ($ch as $fieldName => list($old, $new)) {
             if ($meta->hasField($fieldName) && !array_key_exists($fieldName, $meta->embeddedClasses)) {
                 $mapping = $meta->fieldMappings[$fieldName];
                 $diff[$fieldName] = [
-                    'old' => $this->value($em, Type::getType($mapping['type']), $old),
-                    'new' => $this->value($em, Type::getType($mapping['type']), $new),
+                    'old' => $this->value(Type::getType($mapping['type']), $old),
+                    'new' => $this->value(Type::getType($mapping['type']), $new),
                     'col' => $mapping['columnName'],
                 ];
             } elseif ($meta->hasAssociation($fieldName) && $meta->isSingleValuedAssociation($fieldName)) {
-                $mapping = $meta->associationMappings[$fieldName];
                 $colName = $meta->getSingleAssociationJoinColumnName($fieldName);
-                $assocMeta = $em->getClassMetadata($mapping['targetEntity']);
                 $diff[$fieldName] = [
-                    'old' => $this->assoc($em, $old),
-                    'new' => $this->assoc($em, $new),
+                    'old' => $this->assoc($old),
+                    'new' => $this->assoc($new),
                     'col' => $colName,
                 ];
             }
@@ -499,32 +515,31 @@ class AuditSubscriber implements EventSubscriber
     }
 
     /**
-     * @param EntityManager $em
      * @param null          $association
      * @return array|null
      */
-    protected function assoc(EntityManager $em, $association = null)
+    protected function assoc($association = null)
     {
         if (null === $association) {
             return null;
         }
 
-        $meta = get_class($association);
+        $class = get_class($association);
 
         try {
-            $meta = $em->getClassMetadata($meta);
-            $em->getUnitOfWork()->initializeObject($association);
+            $meta = $this->em->getClassMetadata($class);
+            $this->em->getUnitOfWork()->initializeObject($association);
             $res = [
-                'class' => $meta,
-                'typ'   => $this->typ($meta),
+                'class' => $class,
+                'typ'   => $this->typ($class),
                 'tbl'   => $meta->table['name'],
-                'label' => $this->label($em, $association),
-                'fk'    => $this->id($em, $association)
+                'label' => $this->label($association),
+                'fk'    => $this->id($association)
             ];
         } catch (\Exception $e) {
             $res = [
-                'class' => $meta,
-                'typ'   => $this->typ($meta),
+                'class' => $class,
+                'typ'   => $this->typ($class),
                 'tbl'   => null,
                 'label' => null,
                 'fk'    => $association->getId()
@@ -549,14 +564,13 @@ class AuditSubscriber implements EventSubscriber
     }
 
     /**
-     * @param EntityManager $em
      * @param               $entity
      * @return mixed|string
      */
-    protected function label(EntityManager $em, $entity)
+    protected function label($entity)
     {
         if ($this->labeler instanceof LabelerInterface) {
-            $this->labeler->setEntityManager($em);
+            $this->labeler->setEntityManager($this->em);
             return $this->labeler->label($entity);
         }
 
@@ -564,20 +578,18 @@ class AuditSubscriber implements EventSubscriber
     }
 
     /**
-     * @param EntityManager $em
      * @param Type          $type
      * @param               $value
      * @return mixed
      * @throws \Doctrine\DBAL\DBALException
      */
-    protected function value(EntityManager $em, Type $type, $value)
+    protected function value(Type $type, $value)
     {
-        $platform = $em->getConnection()->getDatabasePlatform();
         switch ($type->getName()) {
             case Type::BOOLEAN:
-                return $type->convertToPHPValue($value, $platform); // json supports boolean values
+                return $type->convertToPHPValue($value, $this->em->getConnection()->getDatabasePlatform()); // json supports boolean values
             default:
-                return $type->convertToDatabaseValue($value, $platform);
+                return $type->convertToDatabaseValue($value, $this->em->getConnection()->getDatabasePlatform());
         }
     }
 
@@ -585,11 +597,11 @@ class AuditSubscriber implements EventSubscriber
      * @param EntityManager $em
      * @return array|null
      */
-    protected function blame(EntityManager $em)
+    protected function blame()
     {
         if ($this->blamer instanceof BlamerInterface) {
             $blamed = $this->blamer->blame($this->securityTokenStorage->getToken());
-            if($blamed) return $this->assoc($em, $blamed);
+            if($blamed) return $this->assoc($blamed);
         }
 
         return null;
